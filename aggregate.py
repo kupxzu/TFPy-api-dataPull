@@ -1,4 +1,3 @@
-# aggregate.py
 import pandas as pd
 
 def group_by_disease_and_week(records):
