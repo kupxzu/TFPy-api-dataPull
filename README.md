@@ -24,3 +24,7 @@ python main.py
 ## Prerequisites & Installation
 
 Ensure you have **Python 3.9+** installed. Install all required dependencies using `pip`:
+
+
+aggregation
+Laravel API Data to (Raw Json) ---> aggregate.py(Weekly Counts Array) ---> predict.py(TensorFlow) to main ---> Forecast to Chief Nurse Dashboard
