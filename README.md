@@ -1,7 +1,9 @@
 "# TFPy-api-dataPull" 
 
 --- install
+pip install python-dotenv (incase for key direct to edit sev)
 pip install requests pandas tensorflow
+pip install google-genai
 
 --- run
 python main.py

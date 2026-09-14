@@ -1,12 +1,27 @@
 import io
 import json
+import os
+import re
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request, send_file
+from google import genai
+from google.genai import types
+
 from api import get_diseases
 from aggregate import group_by_disease_and_week, to_weekly_series
 from predict import detect_trend, classify_risk, get_nursing_advisory
 
 app = Flask(__name__)
+
+# ==========================================
+# GEMINI AI CONFIGURATION (Free Tier)
+# ==========================================
+# Ilagay dito ang iyong Google AI Studio API key
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "use_your_api_key_here_brother")
+
+# I-initialize ang Gemini client kung mayroon nang API key
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 
 def fetch_and_predict(filter_type="all"):
     records = get_diseases()
@@ -19,9 +34,11 @@ def fetch_and_predict(filter_type="all"):
             weekly_counts = to_weekly_series(grouped, disease)
             counts_list = [int(c) for c in weekly_counts]
             
-            slope, forecast_week, forecast_month, volatility, is_emerging = detect_trend(weekly_counts)
-            risk_level, risk_code = classify_risk(slope, weekly_counts, is_emerging)
-            advisory = get_nursing_advisory(disease, risk_code, forecast_week, forecast_month, slope, volatility, is_emerging)
+            slope, forecast_week, volatility = detect_trend(weekly_counts)
+            forecast_month = int(forecast_week) * 4 if forecast_week > 0 else 0
+
+            risk_level, risk_code = classify_risk(slope, weekly_counts)
+            advisory = get_nursing_advisory(disease, risk_code, forecast_week, slope, volatility)
 
             warning_list.append({
                 'disease': str(disease),
@@ -39,6 +56,27 @@ def fetch_and_predict(filter_type="all"):
 
     return warning_list
 
+def is_gibberish(text):
+    text_clean = text.strip().lower()
+    
+    # 1. Kung masyadong maikli at puro consonants o paulit-ulit (tulad ng asd, qwe, zxc)
+    gibberish_patterns = [
+        r'^[asdfghjklqwertyuiopzxcvbnm]+$',  # puro letters na walang vowels
+        r'^(.)\1{3,}$',                      # paulit-ulit na iisang letra (aaaa, zzzz)
+        r'^(asdf|qwer|zxcv)+$',              # mga karaniwang keyboard mash
+    ]
+    
+    for pattern in gibberish_patterns:
+        if re.search(pattern, text_clean):
+            return True
+            
+    # 2. Kung walang vowels at lampas 4 na letra (hal. "qweqweqwe")
+    if len(text_clean) > 4 and not any(v in text_clean for v in 'aeiou'):
+        return True
+        
+    return False
+
+
 
 @app.route("/api/predict")
 def api_predict():
@@ -52,29 +90,55 @@ def api_predict():
     })
 
 
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    req_data = request.get_json() or {}
-    user_message = req_data.get("message", "").lower()
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    data = request.json
+    user_message = data.get('message', '')
     
+    # Kunin ang live surveillance data ng ospital para i-feed bilang context kay Gemini AI
     warnings = fetch_and_predict("all")
-    reply = "I am your ACEMCT Surveillance Assistant. You can ask me about outbreak warnings or specific conditions like Dengue or Influenza."
+    
+    hospital_context = "Current Live ACE Medical Center - Tuguegarao (ACEMCT) Surveillance Data:\n"
+    for w in warnings:
+        hospital_context += f"- Disease: {w['disease']} | Risk: {w['risk_level']} | Next Week Forecast: {w['next_week_forecast']} cases | Next Month Forecast: {w['next_month_forecast']} cases | Advisory: {w['advisory']}\n"
 
-    if any(k in user_message for k in ['high', 'outbreak', 'alert', 'danger', 'spike']):
-        high_risks = [w for w in warnings if w['risk_code'] in ['high', 'moderate']]
-        if high_risks:
-            names = ", ".join([f"{w['disease']} (+{w['next_month_forecast']} expected)" for w in high_risks])
-            reply = f"🚨 Active Outbreak Warnings at ACEMCT: {names}. Please check the nursing protocols table for ward preparation."
-        else:
-            reply = "✅ No critical epidemic alert thresholds have been breached across active hospital data."
-    elif any(k in user_message for k in ['dengue', 'flu', 'asthma', 'covid', 'pneumonia', 'diarrhea', 'hypertension', 'diabetes']):
-        matched = next((w for w in warnings if w['disease'].lower() in user_message), None)
-        if matched:
-            reply = f"📊 **{matched['disease']} Report:** Status is **{matched['risk_level']}**. Projected next month cases: {matched['next_month_forecast']}. Nursing Action: {matched['advisory']}"
-        else:
-            reply = "ℹ️ Condition found in records, but no exact keyword match for your current query."
-    elif 'summary' in user_message or 'total' in user_message:
-        reply = f"🏥 ACEMCT Surveillance Overview: {len(warnings)} total conditions are actively monitored by the system."
+    # Fallback kung sakaling hindi pa nailalagay ang API key
+    if not client:
+        return jsonify({
+            "status": "success", 
+            "reply": "⚠️ **API Key Missing:** Pakilagay muna ang iyong Google AI Studio API key sa `server.py` sa may `GEMINI_API_KEY` para gumana ang AI chatbot."
+        })
+    
+    if is_gibberish(user_message):
+        return jsonify({"status": "success", "reply": "I'm sorry, I cannot answer that."})
+
+    try:
+        # System instructions para mag-act siya bilang Nurse Assistant ng ACEMCT
+        # Mahigpit na Guardrail Instruction para sa Hospital Surveillance lamang
+        system_instruction = (
+            "You are an expert Chief Nursing Surveillance Assistant at ACE Medical Center - Tuguegarao (ACEMCT). "
+            "STRICT RULES:\n"
+            "1. You ONLY answer questions related to hospital disease surveillance, patient admission forecasts, risk levels, outbreaks, ward protocols, nursing care plans, and clinical health data provided below.\n"
+            "2. If the user types random keyboard smashes (e.g., 'asdasdasd', 'qweqwe'), gibberish, meaningless characters, or anything out of the topic of hospital operations, nursing, clinical medicine, or public health surveillance, you MUST reply with EXACTLY this phrase and nothing else: "
+            "\"I'm sorry, I cannot answer that.\"\n\n"
+            f"{hospital_context}"
+        )
+
+        # Paggamit sa Gemini 2.5 Flash (Libre at napakabilis para sa text generation)
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            # model='gemini-3.8-flash',
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.3,
+            ),
+        )
+        
+        reply = response.text
+
+    except Exception as e:
+        reply = f"❌ Error communicating with Google Gemini AI: {str(e)}"
 
     return jsonify({"status": "success", "reply": reply})
 
@@ -96,7 +160,7 @@ def export_report():
             "Next Week Forecast (Cases)": item['next_week_forecast'],
             "Next Month Forecast (Cases)": item['next_month_forecast'],
             "Volatility Score": item['volatility'],
-            "Nursing & Resource Advisories": item['advisory'].replace("<strong>", "").replace("</strong>", "").replace("🚨", "").replace("⚠️", "").replace("✅", "").replace("📦", "")
+            "Nursing & Resource Advisories": item['advisory'].replace("<strong>", "").replace("</strong>", "").replace("🚨", "").replace("⚠️", "").replace("✅", "")
         })
 
     df = pd.DataFrame(export_data)
@@ -144,20 +208,19 @@ def dashboard():
                 <div>
                     <h1 class="text-base sm:text-lg font-black tracking-tight text-slate-900 flex items-center gap-2">
                         ACE Medical Center - Tuguegarao
-                        <span class="bg-emerald-50 text-emerald-700 text-xs px-2.5 py-0.5 rounded-full border border-emerald-200 font-mono font-bold">Nursing Surveillance</span>
+                        <span class="bg-emerald-50 text-emerald-700 text-xs px-2.5 py-0.5 rounded-full border border-emerald-200 font-mono font-bold">AI Surveillance</span>
                     </h1>
-                    <p class="text-xs text-slate-500 font-medium">AI Early Warning & Resource Planning System</p>
+                    <p class="text-xs text-slate-500 font-medium">Powered by Google Gemini AI & TensorFlow</p>
                 </div>
             </div>
 
-            <!-- View Switcher & Export -->
             <div class="flex items-center gap-3">
                 <div class="bg-slate-100 border border-slate-200 rounded-xl p-1 flex items-center gap-1 shadow-inner">
                     <button onclick="switchView('dashboard')" id="btnViewDashboard" class="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-600 text-white transition shadow-xs cursor-pointer flex items-center gap-1.5">
                         <i class="fa-solid fa-chart-pie"></i> <span class="hidden sm:inline">Dashboard</span>
                     </button>
                     <button onclick="switchView('chat')" id="btnViewChat" class="px-3 py-1.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-emerald-700 hover:bg-slate-200/60 transition cursor-pointer flex items-center gap-1.5">
-                        <i class="fa-solid fa-comments"></i> <span class="hidden sm:inline">Nurse Chatbot</span>
+                        <i class="fa-solid fa-comments"></i> <span class="hidden sm:inline">AI Chatbot</span>
                     </button>
                 </div>
 
@@ -173,7 +236,6 @@ def dashboard():
         <!-- VIEW 1: DASHBOARD -->
         <div id="viewDashboard" class="space-y-8">
             
-            <!-- Quick Timeframe Filter Buttons (Non-Tech Friendly) -->
             <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
                 <div class="flex items-center gap-2">
                     <span class="text-xs font-bold text-slate-500 uppercase tracking-wider"><i class="fa-solid fa-filter mr-1 text-emerald-600"></i> Select Timeframe:</span>
@@ -187,7 +249,6 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- Summary Cards -->
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div class="bg-white p-6 rounded-2xl border border-red-200 relative overflow-hidden shadow-sm">
                     <div class="flex justify-between items-start">
@@ -222,23 +283,21 @@ def dashboard():
                             <h3 id="totalTrackedCount" class="text-4xl font-black text-slate-900 mt-2">0</h3>
                         </div>
                         <div class="p-3 bg-slate-100 text-slate-700 rounded-xl border border-slate-200">
-                            <i class="fa-solid id-card-clip text-lg"></i>
+                            <i class="fa-solid fa-id-card-clip text-lg"></i>
                         </div>
                     </div>
                     <p class="text-xs text-slate-500 mt-3">Synchronized live from hospital database</p>
                 </div>
             </div>
 
-            <!-- Graph Section with Bar / Line Switcher -->
             <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                     <div>
                         <h2 class="text-sm font-extrabold text-slate-900 tracking-wide uppercase flex items-center gap-2">
                             <i class="fa-solid fa-chart-line text-emerald-600"></i> Case Forecast & Trend Visualizer
                         </h2>
-                        <p class="text-xs text-slate-500">Easily switch between Bar Graph or Line Graph view</p>
+                        <p class="text-xs text-slate-500">Switch between Bar Graph or Line Graph view</p>
                     </div>
-                    <!-- Chart Type Toggle Switch -->
                     <div class="bg-slate-100 p-1 rounded-xl border border-slate-200 flex items-center gap-1">
                         <button onclick="setChartType('bar')" id="btnChartBar" class="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-600 text-white shadow-xs transition cursor-pointer">
                             <i class="fa-solid fa-chart-column mr-1"></i> Bar Chart
@@ -253,7 +312,6 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- Decision Support Table -->
             <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
                 <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
                     <h2 class="font-bold text-slate-900 flex items-center gap-2">
@@ -279,17 +337,17 @@ def dashboard():
             </div>
         </div>
 
-        <!-- VIEW 2: NURSE CHATBOT -->
+        <!-- VIEW 2: GEMINI AI CHATBOT -->
         <div id="viewChat" class="hidden space-y-4">
             <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col h-[650px]">
                 <div class="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
                     <div class="flex items-center gap-3">
                         <div class="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></div>
                         <h2 class="font-bold text-slate-900 text-sm flex items-center gap-2">
-                            <i class="fa-solid fa-robot text-emerald-600"></i> ACEMCT Nurse Chat Assistant
+                            <i class="fa-solid fa-robot text-emerald-600"></i> Gemini AI Nurse Surveillance Assistant
                         </h2>
                     </div>
-                    <span class="text-xs font-mono text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200">Online</span>
+                    <span class="text-xs font-mono text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200">Gemini 3.6 Flash Active</span>
                 </div>
 
                 <div id="chatMessages" class="flex-grow p-6 overflow-y-auto custom-scrollbar space-y-4 bg-slate-50/50">
@@ -298,12 +356,12 @@ def dashboard():
                             <i class="fa-solid fa-hospital"></i>
                         </div>
                         <div class="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none max-w-xl text-sm text-slate-700 shadow-sm">
-                            <p class="font-bold text-emerald-700 mb-1">Surveillance Assistant</p>
-                            Hello nurse! Ask me quick questions regarding active disease alerts or forecasts. Examples:
+                            <p class="font-bold text-emerald-700 mb-1">Gemini AI Assistant</p>
+                            Hello nurse! I am powered by Google Gemini AI. You can ask me anything regarding our hospital data, outbreak warnings, patient trends, or clinical nursing protocols. Try asking:
                             <ul class="list-disc list-inside mt-2 space-y-1 text-slate-600 text-xs font-medium">
-                                <li><i>"Are there any outbreak alerts today?"</i></li>
-                                <li><i>"What is the forecast for Dengue?"</i></li>
-                                <li><i>"Give me a hospital summary."</i></li>
+                                <li><i>"Which conditions have high outbreak risks right now?"</i></li>
+                                <li><i>"Can you give me a nursing care plan for Dengue?"</i></li>
+                                <li><i>"Summarize our overall hospital admission trends."</i></li>
                             </ul>
                         </div>
                     </div>
@@ -311,7 +369,7 @@ def dashboard():
 
                 <div class="p-4 bg-white border-t border-slate-200">
                     <form id="chatForm" onsubmit="handleChatSubmit(event)" class="flex gap-3">
-                        <input type="text" id="chatInput" placeholder="Type your question here (e.g., Is there a flu outbreak?)..." autocomplete="off"
+                        <input type="text" id="chatInput" placeholder="Ask Gemini AI anything about hospital records or nursing protocols..." autocomplete="off"
                             class="flex-grow bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm text-slate-800 placeholder-slate-400 focus:ring-2 focus:ring-emerald-500 outline-none transition">
                         <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-3 rounded-xl transition shadow-xs flex items-center gap-2 cursor-pointer">
                             <i class="fa-solid fa-paper-plane"></i> <span class="hidden sm:inline">Send</span>
@@ -323,7 +381,6 @@ def dashboard():
 
     </main>
 
-    <!-- Script Logic -->
     <script>
         let forecastChartInstance = null;
         let currentChartType = 'bar';
@@ -351,8 +408,6 @@ def dashboard():
 
         function changeTimeframe(timeframe) {
             activeTimeframe = timeframe;
-            
-            // Highlight active button
             ['today', 'week', 'month', 'year', 'all'].forEach(t => {
                 const btn = document.getElementById(`btn-${t}`);
                 if (t === timeframe) {
@@ -361,7 +416,6 @@ def dashboard():
                     btn.className = "px-4 py-2 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 text-slate-700 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-200 transition cursor-pointer";
                 }
             });
-
             loadDashboardData(timeframe);
         }
 
@@ -539,7 +593,7 @@ def dashboard():
             userBubble.className = "flex items-start gap-3 justify-end";
             userBubble.innerHTML = `
                 <div class="bg-emerald-600 text-white p-4 rounded-2xl rounded-tr-none max-w-xl text-sm shadow-sm">
-                    <p class="font-bold text-emerald-100 mb-1">Nurse</p>
+                    <p class="font-bold text-emerald-100 mb-1">Nurse-in-Charge</p>
                     ${escapeHtml(message)}
                 </div>
                 <div class="p-2.5 bg-emerald-700 text-white rounded-xl shadow-xs">
@@ -558,7 +612,7 @@ def dashboard():
                     <i class="fa-solid fa-hospital"></i>
                 </div>
                 <div class="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none text-sm text-slate-500 shadow-sm">
-                    <i class="fa-solid fa-circle-notch fa-spin text-emerald-600 mr-2"></i> Checking records...
+                    <i class="fa-solid fa-circle-notch fa-spin text-emerald-600 mr-2"></i> Gemini AI is thinking...
                 </div>
             `;
             chatMessages.appendChild(typingBubble);
@@ -581,8 +635,8 @@ def dashboard():
                         <i class="fa-solid fa-hospital"></i>
                     </div>
                     <div class="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none max-w-xl text-sm text-slate-700 shadow-sm">
-                        <p class="font-bold text-emerald-700 mb-1">Surveillance Assistant</p>
-                        ${data.reply}
+                        <p class="font-bold text-emerald-700 mb-1">Gemini AI Assistant</p>
+                        ${escapeHtml(data.reply).replace(/\\n/g, '<br>')}
                     </div>
                 `;
                 chatMessages.appendChild(aiBubble);

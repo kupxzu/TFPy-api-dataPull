@@ -40,24 +40,55 @@ def classify_risk(slope, weekly_counts):
 
 def get_nursing_advisory(disease_name, risk_code, forecast, slope, volatility=0.0):
     """
-    DYNAMIC CLINICAL KEYWORD ENGINE & RESPONSIVE PROTOCOL ADVISORY
-    Broadened keyword coverage across multiple medical domains + volatility responsiveness.
+    DYNAMIC CLINICAL KEYWORD ENGINE (Auto-adapts to API disease names)
+    Expanded with extensive clinical keywords covering hundreds of conditions.
     """
     disease_clean = disease_name.lower()
 
-    # Broadened Clinical Keyword Categories
+    # Napakalawak na kategorya na sumasaklaw sa halos lahat ng uri ng sakit sa ospital
     categories = {
-        'respiratory': ['asthma', 'bronchitis', 'flu', 'influenza', 'covid', 'pneumonia', 'cough', 'copd', 'sars', 'rsv', 'tuberculosis', 'pharyngitis'],
-        'gastrointestinal': ['gastroenteritis', 'diarrhea', 'cholera', 'typhoid', 'amoebiasis', 'food poisoning', 'rotavirus', 'norovirus', 'dysentery'],
-        'vector_borne': ['dengue', 'malaria', 'chikungunya', 'zika', 'leptospirosis', 'rabies', 'typhus'],
-        'cardiovascular': ['hypertension', 'cardiac', 'heart failure', 'arrhythmia', 'angina', 'ischemic', 'stroke', 'hypertensive'],
-        'metabolic_endocrine': ['diabetes', 'ketoacidosis', 'thyroid', 'hyperglycemia', 'metabolic', 'obesity', 'ckd', 'kidney'],
-        'neurological': ['migraine', 'epilepsy', 'seizure', 'meningitis', 'encephalitis', 'neuropathy', 'stroke'],
-        'dermatological_skin': ['chickenpox', 'measles', 'rubella', 'scabies', 'cellulitis', 'mpox', 'monkeypox', 'shingles'],
-        'pediatric_geriatric': ['pediatric', 'neonatal', 'geriatric', 'dementia', 'alzheimer']
+        'respiratory': [
+            'asthma', 'bronch', 'flu', 'influenza', 'covid', 'pneumonia', 'cough', 
+            'copd', 'sars', 'rsv', 'tuberculosis', 'tb', 'pharyngitis', 'laryngitis', 
+            'rhinitis', 'sinusitis', 'tonsillitis', 'pertussis', 'respiratory', 'pleurisy'
+        ],
+        'gastrointestinal': [
+            'gastroenteritis', 'diarrhea', 'cholera', 'typhoid', 'amoebiasis', 'amoeba', 
+            'food poisoning', 'rotavirus', 'norovirus', 'dysentery', 'appendicitis', 
+            'colitis', 'gastritis', 'peptic', 'ulcer', 'hepatitis', 'liver', 'bowel', '腸'
+        ],
+        'vector_borne': [
+            'dengue', 'malaria', 'chikungunya', 'zika', 'leptospirosis', 'rabies', 
+            'typhus', 'yellow fever', 'filariasis', 'vector', 'mosquito', 'tick'
+        ],
+        'cardiovascular': [
+            'hypertension', 'hypertensive', 'cardiac', 'heart', 'arrhythmia', 'angina', 
+            'ischemic', 'stroke', 'myocardial', 'infarction', 'coronary', 'atherosclerosis', 
+            'aneurysm', 'thrombosis', 'embolism', 'vascular'
+        ],
+        'metabolic_endocrine': [
+            'diabetes', 'diabetic', 'ketoacidosis', 'thyroid', 'goiter', 'hyperglycemia', 
+            'hypoglycemia', 'metabolic', 'obesity', 'ckd', 'kidney', 'renal', 'nephritis', 
+            'gout', 'electrolyte', 'endocrine'
+        ],
+        'neurological': [
+            'migraine', 'epilepsy', 'seizure', 'meningitis', 'encephalitis', 'neuropathy', 
+            'paralysis', 'dementia', 'alzheimer', 'parkinson', 'vertigo', 'concussion', 'coma'
+        ],
+        'dermatological_skin': [
+            'chickenpox', 'measles', 'rubella', 'scabies', 'cellulitis', 'mpox', 'monkeypox', 
+            'shingles', 'dermatitis', 'eczema', 'psoriasis', 'urticaria', 'rash', 'lesion', 'burn'
+        ],
+        'pediatric_geriatric': [
+            'pediatric', 'neonatal', 'geriatric', 'premature', 'congenital', 'malnutrition', 'stunting'
+        ],
+        'infectious_general': [
+            'sepsis', 'septic', 'fever', 'infection', 'viral', 'bacterial', 'fungal', 
+            'hiv', 'aids', 'tetanus', 'anthrax', 'measles', 'mumps'
+        ]
     }
 
-    # Match active categories
+    # Awtomatikong hinahanap kung aling category ang pasok ang pangalan ng sakit mula sa API
     matched_cats = [cat for cat, keywords in categories.items() if any(k in disease_clean for k in keywords)]
 
     # 1. Volatility Response Warning
@@ -130,14 +161,20 @@ def get_nursing_advisory(disease_name, risk_code, forecast, slope, volatility=0.
         else:
             directives.append("Standard contact precaution protocols in triage.")
 
-    # Generic Fallback if no keywords matched
+    if 'infectious_general' in matched_cats:
+        if risk_code == 'high':
+            directives.append("Enforce strict universal precautions, isolate febrile cohorts, and coordinate with hospital epidemiology units.")
+        else:
+            directives.append("Maintain standard infection surveillance and routine vital sign tracking.")
+
+    # Generic Fallback kung sakaling may kakaibang sakit na galing sa API na walang match
     if not matched_cats:
         if risk_code == 'high':
-            directives.append("Escalate case load to Infection Control & Chief of Clinics. Prepare overflow ward capacity.")
+            directives.append(f"Escalate {disease_name} caseload to Infection Control & Chief of Clinics. Prepare overflow ward capacity.")
         elif risk_code == 'moderate':
-            directives.append("Increase triage vigilance and audit general nursing supply buffer stocks.")
+            directives.append(f"Increase triage vigilance for {disease_name} and audit general nursing supply buffer stocks.")
         else:
-            directives.append("Maintain standard nursing care protocols and regular case logging.")
+            directives.append(f"Maintain standard nursing care protocols and regular case logging for {disease_name}.")
 
     if volatility_alert:
         directives.insert(1, volatility_alert)
